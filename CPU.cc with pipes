@@ -1,0 +1,576 @@
+#include <iostream>
+#include <list>
+#include <iterator>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <assert.h>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <string.h>
+#include <fcntl.h>
+
+
+#define NUM_SECONDS 20
+#define EVER ;;
+
+#define assertsyscall(x, y) if(!((x) y)){int err = errno; \
+    fprintf(stderr, "In file %s at line %d: ", __FILE__, __LINE__); \
+        perror(#x); exit(err);}
+
+#ifdef EBUG
+#   define dmess(a) cout << "in " << __FILE__ << \
+    " at " << __LINE__ << " " << a << endl;
+
+#   define dprint(a) cout << "in " << __FILE__ << \
+    " at " << __LINE__ << " " << (#a) << " = " << a << endl;
+
+#   define dprintt(a,b) cout << "in " << __FILE__ << \
+    " at " << __LINE__ << " " << a << " " << (#b) << " = " \
+    << b << endl
+#else
+#   define dmess(a)
+#   define dprint(a)
+#   define dprintt(a,b)
+#endif
+
+using namespace std;
+
+// http://man7.org/linux/man-pages/man7/signal-safety.7.html
+
+#define WRITES(a) { const char *foo = a; write(1, foo, strlen(foo)); }
+#define WRITEI(a) { char buf[10]; assert(eye2eh(a, buf, 10, 10) != -1); WRITES(buf); }
+#define WRITEFD(fd, a) {    const char *b = a; \
+				assert(write(fd, b, strlen(b)) != -1);}
+#define READ 0
+#define WRITE 1
+
+struct Pipes
+{
+    int child2Parent[2];
+	int parent2Child[2];
+};    
+
+
+enum STATE { NEW, RUNNING, WAITING, READY, TERMINATED };
+
+struct PCB
+{
+	Pipes *pipes;
+    STATE state;
+    const char *name;   // name of the executable
+    int pid;            // process id from fork();
+    int ppid;           // parent process id
+    int interrupts;     // number of times interrupted
+    int switches;       // may be < interrupts
+    int started;        // the time this process started
+};
+
+PCB *running;
+PCB *idle;
+
+// http://www.cplusplus.com/reference/list/list/
+list<PCB *> new_list;
+list<PCB *> processes;
+
+int sys_time;
+int init_PID;
+
+/*
+** Async-safe integer to a string. i is assumed to be positive. The number
+** of characters converted is returned; -1 will be returned if bufsize is
+** less than one or if the string isn't long enough to hold the entire
+** number. Numbers are right justified. The base must be between 2 and 16;
+** otherwise the string is filled with spaces and -1 is returned.
+*/
+int eye2eh(int i, char *buf, int bufsize, int base)
+{
+    if(bufsize < 1) return(-1);
+    buf[bufsize-1] = '\0';
+    if(bufsize == 1) return(0);
+    if(base < 2 || base > 16)
+    {
+        for(int j = bufsize-2; j >= 0; j--)
+        {
+            buf[j] = ' ';
+        }
+        return(-1);
+    }
+
+    int count = 0;
+    const char *digits = "0123456789ABCDEF";
+    for(int j = bufsize-2; j >= 0; j--)
+    {
+        if(i == 0)
+        {
+            buf[j] = ' ';
+        }
+        else
+        {
+            buf[j] = digits[i%base];
+            i = i/base;
+            count++;
+        }
+    }
+    if(i != 0) return(-1);
+    return(count);
+}
+
+/*
+** a signal handler for those signals delivered to this process, but
+** not already handled.
+*/
+void grab(int signum) { WRITEI(signum); WRITES("\n"); }
+
+// c++decl> declare ISV as array 32 of pointer to function(int) returning void
+void(*ISV[32])(int) = {
+/*        00    01    02    03    04    05    06    07    08    09 */
+/*  0 */ grab, grab, grab, grab, grab, grab, grab, grab, grab, grab,
+/* 10 */ grab, grab, grab, grab, grab, grab, grab, grab, grab, grab,
+/* 20 */ grab, grab, grab, grab, grab, grab, grab, grab, grab, grab,
+/* 30 */ grab, grab
+};
+
+/*
+** stop the running process and index into the ISV to call the ISR
+*/
+void ISR(int signum)
+{
+    if(signum != SIGCHLD)  
+    {
+        if(kill(running->pid, SIGSTOP) == -1)
+        {
+            WRITES("In ISR kill returned: ");
+            WRITEI(errno);
+            WRITES("\n");
+            return;
+        }
+
+        WRITES("In ISR stopped: ");
+        WRITEI(running->pid);
+        WRITES("\n");		
+		running->interrupts++; //when this line is reached, an interrupt has already occurred 		
+        running->state = READY;
+    }
+
+    ISV[signum](signum);
+}
+
+/*
+** an overloaded output operator that prints a PCB
+*/
+ostream& operator <<(ostream &os, struct PCB *pcb)
+{
+    os << "state:        " << pcb->state << endl;
+    os << "name:         " << pcb->name << endl;
+    os << "pid:          " << pcb->pid << endl;
+    os << "ppid:         " << pcb->ppid << endl;
+    os << "interrupts:   " << pcb->interrupts << endl;
+    os << "switches:     " << pcb->switches << endl;
+    os << "started:      " << pcb->started << endl;
+    return(os);
+}
+
+/*
+** an overloaded output operator that prints a list of PCBs
+*/
+ostream& operator <<(ostream &os, list<PCB *> which)
+{
+    list<PCB *>::iterator PCB_iter;
+    for(PCB_iter = which.begin(); PCB_iter != which.end(); PCB_iter++)
+    {
+        os <<(*PCB_iter);
+    }
+    return(os);
+}
+
+/*
+**  send signal to process pid every interval for number of times.
+*/
+void send_signals(int signal, int pid, int interval, int number)
+{
+    dprintt("at beginning of send_signals", getpid());
+
+    for(int i = 1; i <= number; i++)
+    {
+        assertsyscall(sleep(interval), == 0);
+        dprintt("sending", signal);
+        dprintt("to", pid);
+        assertsyscall(kill(pid, signal), == 0)
+    }
+
+    dmess("at end of send_signals");
+}
+
+struct sigaction *create_handler(int signum, void(*handler)(int))
+{
+    struct sigaction *action = new(struct sigaction);
+	
+
+    action->sa_handler = handler;
+
+/*
+**  SA_NOCLDSTOP
+**  If  signum  is  SIGCHLD, do not receive notification when
+**  child processes stop(i.e., when child processes  receive
+**  one of SIGSTOP, SIGTSTP, SIGTTIN or SIGTTOU).
+*/
+    if(signum == SIGCHLD)
+    {
+        action->sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    }
+    else
+    {
+        action->sa_flags =  SA_RESTART;
+    }
+
+    sigemptyset(&(action->sa_mask));
+    assert(sigaction(signum, action, NULL) == 0);
+    return(action);
+}
+
+void scheduler(int signum)
+{
+    WRITES("---- entering scheduler\n");
+    assert(signum == SIGALRM);
+    sys_time++;
+    bool process_found = false;
+	unsigned int i; //processes.size returns unsigned value (from docs)
+	
+	for (i = 1;i <= processes.size(); i++)
+	{
+		PCB *tocont = processes.front();
+		processes.pop_front();
+		processes.push_back(tocont);
+
+		if(tocont->state == NEW) //if we have a new executable process present in our processes list...
+		{
+			WRITES("starting process: "); 
+			WRITES(tocont->name);
+			WRITES("\n");
+			tocont->state = RUNNING;
+			tocont->ppid = init_PID;
+			tocont->interrupts = 0;
+			tocont->switches =0;
+			tocont->started = sys_time;
+			running = tocont;
+
+			if((tocont->pid = fork()) ==0)
+			{// in child 
+				assertsyscall( close (tocont->pipes->child2Parent[READ]), ==0);
+				assertsyscall( close(tocont->pipes->parent2Child[WRITE]), ==0);
+
+				int buffLen = 10;
+				char fdWrite[buffLen],fdRead[buffLen];
+				assertsyscall( eye2eh(tocont->pipes->child2Parent[WRITE], fdWrite, buffLen, 10), != -1 );
+				assertsyscall( eye2eh(tocont->pipes->parent2Child[READ], fdRead,buffLen,10), != -1);
+
+				char path[2+strlen(tocont->name)];
+				strcpy(path,tocont->name);
+				if(execl(path,tocont->name,fdRead,fdWrite,(char *)NULL) == -1)
+				{
+					WRITES("execl error in scheduler:");
+					WRITEI(errno);
+					WRITES("\n");
+					return;
+				}
+				
+
+			}
+		
+			assertsyscall(close(tocont->pipes->child2Parent[WRITE]), ==0);
+			assertsyscall(close(tocont->pipes->parent2Child[READ]), ==0);
+			process_found = true;
+			break;
+		} 
+		else if(tocont->state ==READY) 
+		{
+			WRITES("continuing process :\n");
+			WRITES(tocont->name );
+			WRITES(" with PID: \n");
+			WRITEI(tocont->pid);
+			WRITES("\n");
+			
+			tocont->state = RUNNING;
+			tocont->switches++;
+			running = tocont;
+			
+			if(kill(tocont->pid, SIGCONT) == -1)
+    		{
+    		    WRITES("in sceduler kill error: ");
+        		WRITEI(errno);
+        		WRITES("\n");
+        		return;
+    		}
+			process_found = true;
+			break;
+		}
+	} //end of for loop
+	
+	if(process_found == false) //no processes left to do
+	{
+		WRITES("continuing idle process \n");
+		idle->state = RUNNING;
+		if(kill (idle->pid, SIGCONT) == -1)
+		{
+			WRITES("couldnt continue idle process, error code :");
+			WRITEI(errno);
+			kill (0,SIGTERM); // send SIGTERM 
+		}
+	}
+	
+    WRITES("---- leaving scheduler\n");
+}
+
+void sigtrap_handler(int signum)
+{
+	WRITES("---entering sigtrap_handler \n");
+	assert(signum == SIGTRAP);
+	
+	list<PCB *>:: iterator iter;
+	for(iter = processes.begin(); iter != processes.end(); iter++)
+	{
+		if((*iter)->pipes == NULL) 
+			continue;
+		
+		char buffIn[4096];
+		int bytesRead = read((*iter)->pipes->child2Parent[READ],buffIn,sizeof(buffIn));
+		assert(bytesRead != -1 || errno == EAGAIN);
+		if(bytesRead == 0)
+		{
+			continue;
+		}
+		
+		buffIn[bytesRead ]='\0';
+		
+		int writeFd = (*iter)->pipes->parent2Child[WRITE];
+		char id = buffIn[0];
+		if(id == 0x1) // for showing system time..
+		{
+			int len = 10;
+			char outBuf[len];
+			assertsyscall(eye2eh(sys_time, outBuf,len,10), != -1);
+			WRITEFD( writeFd, outBuf);
+		}
+		else if( id == 0x2)
+		{
+			char buffOut[2048];
+			int len = 10;
+			char convert[len];
+			strcpy(buffOut, "Calling process info: \n");
+			strcat(buffOut,"State:");
+			assertsyscall( eye2eh((*iter)->state, convert,len,10), !=-1);
+			strcat(buffOut,convert);
+			strcat(buffOut, "\n");
+			strcat(buffOut,"name: ");
+			strcat(buffOut, (*iter)->name);
+			strcat(buffOut, "\n");
+
+			strcat(buffOut, "pid: ");
+            assertsyscall( eye2eh((*iter)->pid, convert, len, 10), != -1 ); 
+			strcat(buffOut, convert); 
+			strcat(buffOut, "\n");
+
+
+
+            strcat(buffOut, "ppid: ");
+            assertsyscall( eye2eh((*iter)->ppid, convert, len, 10), != -1 ); 
+            strcat(buffOut, convert);
+	        strcat(buffOut, "\n");
+
+            strcat(buffOut, "interrupts: ");
+            assertsyscall( eye2eh((*iter)->interrupts, convert, len, 10), != -1 ); 
+            strcat(buffOut, convert); 
+		    strcat(buffOut, "\n");
+
+            strcat(buffOut, "switches: ");
+            assertsyscall( eye2eh((*iter)->switches, convert, len, 10), != -1 ); 
+            strcat(buffOut, convert);
+			strcat(buffOut, "\n");
+
+            strcat(buffOut, "started: ");
+            assertsyscall( eye2eh((*iter)->started, convert, len, 10), != -1 ); 
+            strcat(buffOut, convert); 
+			strcat(buffOut, "\n");
+
+			WRITEFD( writeFd, buffOut );
+
+		}
+		else if( id == 0x3)
+		{
+			char buffOut[2048];
+            strcpy(buffOut, "Process list:\n");
+            list<PCB *>::iterator pList;
+            for (pList = processes.begin(); pList != processes.end(); pList++)
+			{
+                strcat(buffOut, (*pList)->name);
+                strcat(buffOut, "\n");
+            }
+			WRITEFD( writeFd, buffOut );
+		}
+		else if( id == 0x4)
+		{
+			if(bytesRead > 1)
+			{
+                int i=0;
+                while(buffIn[i] != '\0')
+                   	assert (write (STDOUT_FILENO, &buffIn[i++], 1) >= 0);
+                WRITEFD( writeFd, "writing to standard output" );
+			}
+		}
+		
+			
+		}
+
+		WRITES("\n----- leaving sigtrap_handler \n");
+
+		
+	}
+	
+
+
+void process_done(int signum)
+{
+    assert(signum == SIGCHLD);
+    WRITES("---- entering process_done\n");
+
+    // might have multiple children done.
+    for(;;)
+    {
+        int status, cpid;
+
+        // we know we received a SIGCHLD so don't wait.
+        cpid = waitpid(-1, &status, WNOHANG);
+
+        if(cpid < 0)
+        {
+            WRITES("cpid < 0\n");
+            assertsyscall(kill(0, SIGTERM), != 0);
+        }
+        else if(cpid == 0)
+        {
+            // no more children.
+            break;
+        }
+        else
+        {
+            WRITES("process exited: ");
+            list <PCB *>:: iterator iter;
+			for (iter = processes.begin(); iter != processes.end(); iter++)
+			{
+				if((*iter)->pid == cpid)
+				{
+					(*iter)->state = TERMINATED;
+					cout << *iter <<endl;
+				}
+			}
+        }
+    }
+	WRITES("---continuing idle process \n");
+	running = idle;
+	if(kill (idle->pid,SIGCONT) == -1)
+	{
+		WRITES("couldnt continue idle process, error code :");
+		WRITEI(errno);
+		kill (0,SIGTERM); // send SIGTERM 
+	}
+    WRITES("---- leaving process_done\n");
+}
+
+
+/*
+** set up the "hardware"
+*/
+void boot()
+{
+    sys_time = 0;
+
+    ISV[SIGALRM] = scheduler;
+    ISV[SIGCHLD] = process_done;
+	ISV[SIGTRAP] = sigtrap_handler;
+    struct sigaction *alarm = create_handler(SIGALRM, ISR);
+    struct sigaction *child = create_handler(SIGCHLD, ISR);
+	struct sigaction *trap = create_handler(SIGTRAP,ISR);
+	
+
+    // start up clock interrupt
+    int ret;
+    if((ret = fork()) == 0)
+    {
+        send_signals(SIGALRM, getppid(), 1, NUM_SECONDS);
+
+        // once that's done, cleanup and really kill everything...
+        delete(alarm);
+        delete(child);
+        delete(idle);
+		delete(trap);
+        kill(0, SIGTERM);
+    }
+
+    if(ret < 0)
+    {
+        perror("fork");
+    }
+}
+
+void create_idle()
+{
+    idle = new(PCB);
+    idle->state = READY;
+    idle->name = "IDLE";
+    idle->ppid = getpid();
+    idle->interrupts = 0;
+    idle->switches = 0;
+    idle->started = sys_time;
+	
+    if((idle->pid = fork()) == 0)
+    {
+        pause();
+        perror("pause in create_idle");
+    }
+}
+
+int main(int argc, char **argv)
+{
+	int i; //to be used in for loop below
+	for(i =1; i < argc; i++)
+	{
+		PCB *newProc = new(PCB);
+		newProc->state = NEW;
+		newProc->name = argv[i];
+		newProc->pid = 0;
+		newProc->ppid = 0;
+		newProc->interrupts = 0;
+		newProc->switches = 0;
+		newProc->started = 0;
+		newProc->pipes = new(Pipes);
+		assertsyscall(pipe(newProc->pipes->child2Parent), == 0 );
+		assertsyscall(pipe(newProc->pipes->parent2Child), == 0 );
+		
+		int fl;
+		assertsyscall((fl = fcntl(newProc->pipes->child2Parent[READ], F_GETFL)) , !=-1);
+		assertsyscall(fcntl(newProc->pipes->child2Parent[READ], F_SETFL, fl | O_NONBLOCK), ==0);
+		
+		processes.push_back(newProc);
+	}
+    boot();
+    init_PID = getpid();
+    create_idle();
+    running = idle;
+    cout << running;
+
+    // we keep this process around so that the children don't die and
+    // to keep the IRQs in place.
+    for(EVER)
+    {
+        // "Upon termination of a signal handler started during a
+        // pause(), the pause() call will return."
+        pause();
+    }
+}
+
+
